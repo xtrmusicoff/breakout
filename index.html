@@ -96,10 +96,33 @@ const BRICK_W = (W - 2 * BRICK_MARGIN - (BRICK_COLS - 1) * BRICK_GAP) / BRICK_CO
 const ROW_COLORS = ['#e74c3c', '#e67e22', '#f1c40f', '#2ecc71', '#3498db'];
 const PARTICLES_PER_BRICK = 14;
 
-// State: 'ready' (ball on paddle), 'playing', 'over', 'won'
-let paddle, ball, bricks, score, lives, state;
+// Power-ups
+const POWERUP_DROP_CHANCE = 0.15;   // chance a broken brick drops a capsule
+const CAPSULE_W = 28;
+const CAPSULE_H = 16;
+const CAPSULE_SPEED = 2.5;          // px per frame
+const WIDE_FACTOR = 1.6;            // wide paddle is 60% wider
+const WIDE_MS = 10000;
+const SLOW_FACTOR = 0.6;            // slow ball moves at 60% speed
+const SLOW_MS = 6000;
+const MAX_EXTRA_BALLS = 4;
+const MULTI_SPLIT_ANGLE = 0.45;     // radians the extra balls split off by
+const POWERUP_TYPES = {
+  W: { color: '#9b59b6', name: 'wide paddle' },
+  M: { color: '#1abc9c', name: 'multi-ball' },
+  S: { color: '#e84393', name: 'slow ball' }
+};
+
+// State: 'ready' (ball on paddle), 'playing', 'paused', 'over', 'won'
+let paddle, ball, extraBalls, capsules, bricks, score, lives, state;
 let particles = [];
 let muted = false;
+let mouseTargetX = null; // paddle X the mouse last asked for (null = mouse not used yet)
+let mouseInside = false; // true while the cursor is over the game canvas
+let needsGlide = false;  // true when the paddle must glide to the mouse instead of snapping
+const MOUSE_GLIDE_SPEED = 12; // max px per frame for gliding to the mouse
+let wideLeft = 0;        // ms of wide paddle left
+let slowLeft = 0;        // ms of slow ball left
 
 // Endless mode
 let endless = false;
@@ -115,7 +138,9 @@ const MAX_BALL_SPEED = 12;          // keeps the ball from skipping through the 
 const sounds = {
   platform: new Audio('sounds/platform.mp3'),
   wall: new Audio('sounds/wall.mp3'),
-  brick: new Audio('sounds/brick.mp3')
+  brick: new Audio('sounds/brick.mp3'),
+  powerup: new Audio('sounds/powerup.mp3'),
+  powerup_lose: new Audio('sounds/powerup_lose.mp3')
 };
 
 function playSound(name) {
@@ -170,6 +195,10 @@ function newGame() {
   lives = endless ? 1 : 3;
   state = 'ready';
   particles = [];
+  extraBalls = [];
+  capsules = [];
+  wideLeft = 0;
+  slowLeft = 0;
   ballSpeed = BALL_SPEED;
   milestonesReached = 0;
   placeBallOnPaddle();
@@ -193,11 +222,17 @@ function updateEndless(dt) {
   }
 }
 
+function allBalls() {
+  return [ball, ...extraBalls];
+}
+
 function setBallSpeed(newSpeed) {
   const ratio = newSpeed / ballSpeed;
   ballSpeed = newSpeed;
-  ball.dx *= ratio;
-  ball.dy *= ratio;
+  for (const b of allBalls()) {
+    b.dx *= ratio;
+    b.dy *= ratio;
+  }
 }
 
 function checkMilestones() {
@@ -210,9 +245,74 @@ function checkMilestones() {
   }
 }
 
+// Power-ups ----------------------------------------------------------
+
+// Called every playing frame: counts down timers and sets the paddle width
+function tickPowerups(dt) {
+  const wasWide = wideLeft > 0;
+  const wasSlow = slowLeft > 0;
+  wideLeft = Math.max(0, wideLeft - dt);
+  slowLeft = Math.max(0, slowLeft - dt);
+  if (wasWide && wideLeft === 0) playSound('powerup_lose');
+  if (wasSlow && slowLeft === 0) playSound('powerup_lose');
+  const newW = wideLeft > 0 ? PADDLE_W * WIDE_FACTOR : PADDLE_W;
+  if (newW !== paddle.w) {
+    const center = paddle.x + paddle.w / 2; // keep the paddle centered when it resizes
+    paddle.w = newW;
+    paddle.x = clamp(center - newW / 2, 0, W - newW);
+  }
+}
+
+// Adds two balls that split off the main ball at an angle
+function spawnExtraBalls() {
+  for (const sign of [-1, 1]) {
+    if (extraBalls.length >= MAX_EXTRA_BALLS) break;
+    const a = sign * MULTI_SPLIT_ANGLE;
+    const cos = Math.cos(a);
+    const sin = Math.sin(a);
+    extraBalls.push({
+      x: ball.x,
+      y: ball.y,
+      dx: ball.dx * cos - ball.dy * sin,
+      dy: ball.dx * sin + ball.dy * cos
+    });
+  }
+}
+
+// Catching a timed power-up that is already active restarts its timer
+function applyPowerup(type) {
+  playSound('powerup');
+  if (type === 'W') wideLeft = WIDE_MS;
+  if (type === 'M') spawnExtraBalls();
+  if (type === 'S') slowLeft = SLOW_MS;
+}
+
+// Capsules fall; catching one with the paddle applies it
+function updateCapsules() {
+  capsules = capsules.filter(c => {
+    c.y += CAPSULE_SPEED;
+    const caught =
+      c.y + CAPSULE_H / 2 >= PADDLE_Y &&
+      c.y - CAPSULE_H / 2 <= PADDLE_Y + PADDLE_H &&
+      c.x + CAPSULE_W / 2 >= paddle.x &&
+      c.x - CAPSULE_W / 2 <= paddle.x + paddle.w;
+    if (caught) {
+      applyPowerup(c.type);
+      return false;
+    }
+    return c.y - CAPSULE_H / 2 <= H; // drop it once it leaves the bottom
+  });
+}
+
+// ---------------------------------------------------------------------
+
 function togglePause() {
-  if (state === 'playing') state = 'paused';
-  else if (state === 'paused') state = 'playing';
+  if (state === 'playing') {
+    state = 'paused';
+  } else if (state === 'paused') {
+    state = 'playing';
+    needsGlide = true; // catch up to the mouse smoothly after unpausing
+  }
 }
 
 function handleAction() {
@@ -247,13 +347,90 @@ function updateParticles() {
   particles = particles.filter(p => p.life > 0);
 }
 
+// Moves one ball for this frame: walls, paddle, bricks. Returns 'fell' if it went past the paddle.
+function stepBall(b) {
+  const f = slowLeft > 0 ? SLOW_FACTOR : 1;
+  b.x += b.dx * f;
+  b.y += b.dy * f;
+
+  // Side and top walls
+  if (b.x - BALL_R < 0) { b.x = BALL_R; b.dx = -b.dx; playSound('wall'); }
+  if (b.x + BALL_R > W) { b.x = W - BALL_R; b.dx = -b.dx; playSound('wall'); }
+  if (b.y - BALL_R < 0) { b.y = BALL_R; b.dy = -b.dy; playSound('wall'); }
+
+  // Paddle: bounce angle depends on where the ball hits it
+  if (b.dy > 0 &&
+      b.y + BALL_R >= PADDLE_Y &&
+      b.y - BALL_R <= PADDLE_Y + PADDLE_H &&
+      b.x >= paddle.x - BALL_R &&
+      b.x <= paddle.x + paddle.w + BALL_R) {
+    const hit = clamp((b.x - (paddle.x + paddle.w / 2)) / (paddle.w / 2), -1, 1);
+    const maxAngle = Math.PI / 3; // 60 degrees from vertical
+    const angle = hit * maxAngle;
+    b.dx = ballSpeed * Math.sin(angle);
+    b.dy = -ballSpeed * Math.cos(angle);
+    b.y = PADDLE_Y - BALL_R;
+    playSound('platform');
+  }
+
+  // Bricks: circle vs rectangle, one brick per frame
+  for (const br of bricks) {
+    if (!br.alive) continue;
+    const nearX = clamp(b.x, br.x, br.x + br.w);
+    const nearY = clamp(b.y, br.y, br.y + br.h);
+    const ox = b.x - nearX;
+    const oy = b.y - nearY;
+    if (ox * ox + oy * oy < BALL_R * BALL_R) {
+      br.alive = false;
+      score += br.points;
+      if (endless) {
+        br.restoreIn = ENDLESS_RESTORE_MS;
+        checkMilestones();
+      }
+      if (Math.random() < POWERUP_DROP_CHANCE) {
+        const types = Object.keys(POWERUP_TYPES);
+        capsules.push({
+          x: br.x + br.w / 2,
+          y: br.y + br.h / 2,
+          type: types[Math.floor(Math.random() * types.length)]
+        });
+      }
+      spawnParticles(br.x + br.w / 2, br.y + br.h / 2, br.color);
+      playSound('brick');
+      // Reflect along the axis with the smaller penetration
+      if (Math.abs(ox) > Math.abs(oy)) b.dx = -b.dx;
+      else b.dy = -b.dy;
+      updateHud();
+      break;
+    }
+  }
+
+  return b.y - BALL_R > H ? 'fell' : 'ok';
+}
+
 function update() {
   if (state === 'paused') return;
 
-  // Keyboard paddle movement
-  if (keys['ArrowLeft'] || keys['a'] || keys['A']) paddle.x -= PADDLE_SPEED;
-  if (keys['ArrowRight'] || keys['d'] || keys['D']) paddle.x += PADDLE_SPEED;
+  // Keyboard paddle movement (using the keys hands control back from the mouse)
+  if (keys['ArrowLeft'] || keys['a'] || keys['A']) { paddle.x -= PADDLE_SPEED; mouseTargetX = null; needsGlide = true; }
+  if (keys['ArrowRight'] || keys['d'] || keys['D']) { paddle.x += PADDLE_SPEED; mouseTargetX = null; needsGlide = true; }
   paddle.x = clamp(paddle.x, 0, W - paddle.w);
+
+  // Mouse control: while the cursor is over the field, the paddle follows its X position in real time.
+  // When needsGlide is set (cursor re-entered, unpaused, or keys used), it glides instead of snapping.
+  if (mouseInside && mouseTargetX !== null) {
+    if (needsGlide) {
+      const diff = mouseTargetX - paddle.x;
+      if (Math.abs(diff) <= MOUSE_GLIDE_SPEED) {
+        paddle.x = mouseTargetX;
+        needsGlide = false;
+      } else {
+        paddle.x += Math.sign(diff) * MOUSE_GLIDE_SPEED;
+      }
+    } else {
+      paddle.x = mouseTargetX;
+    }
+  }
 
   updateParticles();
 
@@ -263,68 +440,33 @@ function update() {
   }
   if (state !== 'playing') return;
 
-  ball.x += ball.dx;
-  ball.y += ball.dy;
+  updateCapsules();
 
-  // Side and top walls
-  if (ball.x - BALL_R < 0) { ball.x = BALL_R; ball.dx = -ball.dx; playSound('wall'); }
-  if (ball.x + BALL_R > W) { ball.x = W - BALL_R; ball.dx = -ball.dx; playSound('wall'); }
-  if (ball.y - BALL_R < 0) { ball.y = BALL_R; ball.dy = -ball.dy; playSound('wall'); }
-
-  // Paddle: bounce angle depends on where the ball hits it
-  if (ball.dy > 0 &&
-      ball.y + BALL_R >= PADDLE_Y &&
-      ball.y - BALL_R <= PADDLE_Y + PADDLE_H &&
-      ball.x >= paddle.x - BALL_R &&
-      ball.x <= paddle.x + paddle.w + BALL_R) {
-    const hit = clamp((ball.x - (paddle.x + paddle.w / 2)) / (paddle.w / 2), -1, 1);
-    const maxAngle = Math.PI / 3; // 60 degrees from vertical
-    const angle = hit * maxAngle;
-    ball.dx = ballSpeed * Math.sin(angle);
-    ball.dy = -ballSpeed * Math.cos(angle);
-    ball.y = PADDLE_Y - BALL_R;
-    playSound('platform');
-  }
-
-  // Bricks: circle vs rectangle, one brick per frame
-  for (const b of bricks) {
-    if (!b.alive) continue;
-    const nearX = clamp(ball.x, b.x, b.x + b.w);
-    const nearY = clamp(ball.y, b.y, b.y + b.h);
-    const ox = ball.x - nearX;
-    const oy = ball.y - nearY;
-    if (ox * ox + oy * oy < BALL_R * BALL_R) {
-      b.alive = false;
-      score += b.points;
-      if (endless) {
-        b.restoreIn = ENDLESS_RESTORE_MS;
-        checkMilestones();
-      }
-      spawnParticles(b.x + b.w / 2, b.y + b.h / 2, b.color);
-      playSound('brick');
-      // Reflect along the axis with the smaller penetration
-      if (Math.abs(ox) > Math.abs(oy)) ball.dx = -ball.dx;
-      else ball.dy = -ball.dy;
+  // Main ball. If it falls while extra balls are still in play, one of them takes its place.
+  if (stepBall(ball) === 'fell') {
+    if (extraBalls.length > 0) {
+      ball = extraBalls.shift();
+    } else {
+      lives--;
       updateHud();
-      break;
+      wideLeft = 0;
+      slowLeft = 0;
+      capsules = [];
+      if (lives <= 0) {
+        state = 'over';
+      } else {
+        state = 'ready';
+        placeBallOnPaddle();
+      }
+      return;
     }
   }
+
+  // Extra balls: remove the ones that fall
+  extraBalls = extraBalls.filter(b => stepBall(b) !== 'fell');
 
   if (!endless && bricks.every(b => !b.alive)) {
     state = 'won';
-    return;
-  }
-
-  // Ball fell past the paddle
-  if (ball.y - BALL_R > H) {
-    lives--;
-    updateHud();
-    if (lives <= 0) {
-      state = 'over';
-    } else {
-      state = 'ready';
-      placeBallOnPaddle();
-    }
   }
 }
 
@@ -337,6 +479,29 @@ function drawCenterText(title, subtitle) {
   ctx.fillText(title, W / 2, H / 2);
   ctx.font = '18px Arial';
   ctx.fillText(subtitle, W / 2, H / 2 + 35);
+}
+
+// Time bars for active timed power-ups, in the top-left corner of the field
+function drawPowerupBars() {
+  const bars = [];
+  if (wideLeft > 0) bars.push({ label: 'WIDE', color: POWERUP_TYPES.W.color, frac: wideLeft / WIDE_MS });
+  if (slowLeft > 0) bars.push({ label: 'SLOW', color: POWERUP_TYPES.S.color, frac: slowLeft / SLOW_MS });
+  const BAR_X = 72;
+  const BAR_W = 120;
+  const BAR_H = 10;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 12px Arial';
+  bars.forEach((bar, i) => {
+    const y = 12 + i * 20;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(bar.label, 10, y + BAR_H / 2);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(BAR_X, y, BAR_W, BAR_H);
+    ctx.fillStyle = bar.color;
+    ctx.fillRect(BAR_X, y, BAR_W * bar.frac, BAR_H);
+  });
+  ctx.textBaseline = 'alphabetic';
 }
 
 function draw() {
@@ -353,6 +518,18 @@ function draw() {
     ctx.fillRect(b.x, b.y + b.h - 4, b.w, 4);
   }
 
+  // Falling power-up capsules
+  ctx.font = 'bold 11px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const c of capsules) {
+    ctx.fillStyle = POWERUP_TYPES[c.type].color;
+    ctx.fillRect(c.x - CAPSULE_W / 2, c.y - CAPSULE_H / 2, CAPSULE_W, CAPSULE_H);
+    ctx.fillStyle = '#000';
+    ctx.fillText(c.type, c.x, c.y + 1);
+  }
+  ctx.textBaseline = 'alphabetic';
+
   // Particles from broken bricks
   for (const p of particles) {
     ctx.globalAlpha = Math.max(p.life, 0);
@@ -364,11 +541,14 @@ function draw() {
   ctx.fillStyle = '#ddd';
   ctx.fillRect(paddle.x, PADDLE_Y, paddle.w, PADDLE_H);
 
-  ctx.beginPath();
-  ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI * 2);
   ctx.fillStyle = '#fff';
-  ctx.fill();
+  for (const b of allBalls()) {
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, BALL_R, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
+  drawPowerupBars();
   if (state === 'ready') drawCenterText('BREAKOUT', 'Press Space or click to launch');
   if (state === 'over') {
     drawCenterText('GAME OVER', endless ? 'Final score: ' + score + '  |  Press Space to play again' : 'Press Space to play again');
@@ -380,7 +560,10 @@ function draw() {
 function loop(now) {
   const dt = lastFrameTime === null ? 0 : Math.min(now - lastFrameTime, 100);
   lastFrameTime = now;
-  if (endless && state === 'playing') updateEndless(dt);
+  if (state === 'playing') {
+    tickPowerups(dt);
+    if (endless) updateEndless(dt);
+  }
   update();
   draw();
   requestAnimationFrame(loop);
@@ -406,10 +589,17 @@ document.addEventListener('keyup', e => {
 });
 
 // Mouse
+canvas.addEventListener('mouseenter', () => {
+  mouseInside = true;
+  needsGlide = true; // glide in if the cursor re-enters at a different spot
+});
+canvas.addEventListener('mouseleave', () => {
+  mouseInside = false; // paddle stays where it is
+});
 canvas.addEventListener('mousemove', e => {
   const rect = canvas.getBoundingClientRect();
   const mx = (e.clientX - rect.left) * (W / rect.width);
-  paddle.x = clamp(mx - paddle.w / 2, 0, W - paddle.w);
+  mouseTargetX = clamp(mx - paddle.w / 2, 0, W - paddle.w);
 });
 canvas.addEventListener('click', handleAction);
 
