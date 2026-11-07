@@ -5,8 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Breakout</title>
 <style>
+  :root {
+    /* Game width: 800px at most, and shrinks so the whole page fits the window */
+    --game-w: max(320px, min(800px, calc(100vw - 40px), calc((100vh - 260px) * 4 / 3)));
+  }
   body {
     margin: 0;
+    padding: 16px;
+    box-sizing: border-box;
     min-height: 100vh;
     display: flex;
     flex-direction: column;
@@ -17,8 +23,7 @@
     font-family: Arial, sans-serif;
   }
   #hud {
-    width: 800px;
-    max-width: 100%;
+    width: var(--game-w);
     display: flex;
     justify-content: space-between;
     font-size: 18px;
@@ -27,11 +32,30 @@
   canvas {
     background: #000;
     border: 2px solid #444;
-    max-width: 100%;
+    box-sizing: border-box;
+    width: var(--game-w);
     height: auto;
     cursor: none;
   }
-  p { color: #888; font-size: 14px; }
+  #controls {
+    color: #888;
+    font-size: 14px;
+    line-height: 1.7;
+    margin: 12px 0 4px;
+  }
+  #controls li { list-style: none; }
+  #controls kbd {
+    display: inline-block;
+    min-width: 28px;
+    padding: 1px 6px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    background: #222;
+    color: #ccc;
+    text-align: center;
+    font-family: inherit;
+  }
+  #endless-status { font-size: 15px; font-weight: bold; color: #eee; margin: 6px 0 0; }
 </style>
 </head>
 <body>
@@ -40,7 +64,14 @@
     <span>Lives: <span id="lives">3</span></span>
   </div>
   <canvas id="game" width="800" height="600"></canvas>
-  <p>Move: mouse, ← → or A / D. Space or click to launch. Space restarts after game over.</p>
+  <ul id="controls">
+    <li><kbd>←</kbd> <kbd>→</kbd> or <kbd>A</kbd> <kbd>D</kbd> &nbsp;or&nbsp; mouse: move paddle</li>
+    <li><kbd>Space</kbd> or click: launch ball (and restart after game over)</li>
+    <li><kbd>P</kbd>: pause / resume</li>
+    <li><kbd>M</kbd>: mute / unmute sound</li>
+    <li><kbd>I</kbd>: toggle Endless mode (before starting)</li>
+  </ul>
+  <p id="endless-status">Endless: OFF</p>
 
 <script>
 const canvas = document.getElementById('game');
@@ -68,6 +99,17 @@ const PARTICLES_PER_BRICK = 14;
 // State: 'ready' (ball on paddle), 'playing', 'over', 'won'
 let paddle, ball, bricks, score, lives, state;
 let particles = [];
+let muted = false;
+
+// Endless mode
+let endless = false;
+let ballSpeed = BALL_SPEED;
+let milestonesReached = 0;
+let lastFrameTime = null;
+const ENDLESS_RESTORE_MS = 60000;   // broken bricks come back every minute
+const MILESTONE_POINTS = 200;       // speed-up every 200 points
+const MILESTONE_SPEED_STEP = 0.5;
+const MAX_BALL_SPEED = 12;          // keeps the ball from skipping through the paddle
 
 // Sound effects
 const sounds = {
@@ -77,6 +119,7 @@ const sounds = {
 };
 
 function playSound(name) {
+  if (muted) return;
   const s = sounds[name];
   s.currentTime = 0;
   s.play().catch(() => {}); // ignore errors, e.g. autoplay blocked
@@ -98,7 +141,8 @@ function makeBricks() {
         h: BRICK_H,
         color: ROW_COLORS[r],
         alive: true,
-        points: (BRICK_ROWS - r) * 10
+        points: (BRICK_ROWS - r) * 10,
+        restoreIn: 0 // ms left until this brick returns (Endless mode)
       });
     }
   }
@@ -123,9 +167,11 @@ function newGame() {
   paddle = { x: (W - PADDLE_W) / 2, w: PADDLE_W };
   bricks = makeBricks();
   score = 0;
-  lives = 3;
+  lives = endless ? 1 : 3;
   state = 'ready';
   particles = [];
+  ballSpeed = BALL_SPEED;
+  milestonesReached = 0;
   placeBallOnPaddle();
   updateHud();
 }
@@ -133,9 +179,40 @@ function newGame() {
 function launchBall() {
   // Launch at a slight random angle, up and away from vertical
   const angle = (Math.random() * 0.6 - 0.3);
-  ball.dx = BALL_SPEED * Math.sin(angle);
-  ball.dy = -BALL_SPEED * Math.cos(angle);
+  ball.dx = ballSpeed * Math.sin(angle);
+  ball.dy = -ballSpeed * Math.cos(angle);
   state = 'playing';
+}
+
+// Each broken brick has its own countdown and returns when it reaches zero
+function updateEndless(dt) {
+  for (const b of bricks) {
+    if (b.alive) continue;
+    b.restoreIn -= dt;
+    if (b.restoreIn <= 0) b.alive = true;
+  }
+}
+
+function setBallSpeed(newSpeed) {
+  const ratio = newSpeed / ballSpeed;
+  ballSpeed = newSpeed;
+  ball.dx *= ratio;
+  ball.dy *= ratio;
+}
+
+function checkMilestones() {
+  const reached = Math.floor(score / MILESTONE_POINTS);
+  while (milestonesReached < reached) {
+    milestonesReached++;
+    if (ballSpeed < MAX_BALL_SPEED) {
+      setBallSpeed(Math.min(ballSpeed + MILESTONE_SPEED_STEP, MAX_BALL_SPEED));
+    }
+  }
+}
+
+function togglePause() {
+  if (state === 'playing') state = 'paused';
+  else if (state === 'paused') state = 'playing';
 }
 
 function handleAction() {
@@ -171,6 +248,8 @@ function updateParticles() {
 }
 
 function update() {
+  if (state === 'paused') return;
+
   // Keyboard paddle movement
   if (keys['ArrowLeft'] || keys['a'] || keys['A']) paddle.x -= PADDLE_SPEED;
   if (keys['ArrowRight'] || keys['d'] || keys['D']) paddle.x += PADDLE_SPEED;
@@ -201,8 +280,8 @@ function update() {
     const hit = clamp((ball.x - (paddle.x + paddle.w / 2)) / (paddle.w / 2), -1, 1);
     const maxAngle = Math.PI / 3; // 60 degrees from vertical
     const angle = hit * maxAngle;
-    ball.dx = BALL_SPEED * Math.sin(angle);
-    ball.dy = -BALL_SPEED * Math.cos(angle);
+    ball.dx = ballSpeed * Math.sin(angle);
+    ball.dy = -ballSpeed * Math.cos(angle);
     ball.y = PADDLE_Y - BALL_R;
     playSound('platform');
   }
@@ -217,6 +296,10 @@ function update() {
     if (ox * ox + oy * oy < BALL_R * BALL_R) {
       b.alive = false;
       score += b.points;
+      if (endless) {
+        b.restoreIn = ENDLESS_RESTORE_MS;
+        checkMilestones();
+      }
       spawnParticles(b.x + b.w / 2, b.y + b.h / 2, b.color);
       playSound('brick');
       // Reflect along the axis with the smaller penetration
@@ -227,7 +310,7 @@ function update() {
     }
   }
 
-  if (bricks.every(b => !b.alive)) {
+  if (!endless && bricks.every(b => !b.alive)) {
     state = 'won';
     return;
   }
@@ -287,11 +370,17 @@ function draw() {
   ctx.fill();
 
   if (state === 'ready') drawCenterText('BREAKOUT', 'Press Space or click to launch');
-  if (state === 'over') drawCenterText('GAME OVER', 'Press Space to play again');
+  if (state === 'over') {
+    drawCenterText('GAME OVER', endless ? 'Final score: ' + score + '  |  Press Space to play again' : 'Press Space to play again');
+  }
   if (state === 'won') drawCenterText('YOU WIN!', 'Press Space to play again');
+  if (state === 'paused') drawCenterText('PAUSED', 'Press P to resume');
 }
 
-function loop() {
+function loop(now) {
+  const dt = lastFrameTime === null ? 0 : Math.min(now - lastFrameTime, 100);
+  lastFrameTime = now;
+  if (endless && state === 'playing') updateEndless(dt);
   update();
   draw();
   requestAnimationFrame(loop);
@@ -302,6 +391,15 @@ document.addEventListener('keydown', e => {
   keys[e.key] = true;
   if (e.key === ' ' || e.key.startsWith('Arrow')) e.preventDefault();
   if (e.key === ' ') handleAction();
+  if (e.repeat) return;
+  if (e.key === 'p' || e.key === 'P') togglePause();
+  if (e.key === 'm' || e.key === 'M') muted = !muted;
+  if ((e.key === 'i' || e.key === 'I') && state === 'ready') {
+    endless = !endless;
+    lives = endless ? 1 : 3;
+    document.getElementById('endless-status').textContent = 'Endless: ' + (endless ? 'ON' : 'OFF');
+    updateHud();
+  }
 });
 document.addEventListener('keyup', e => {
   keys[e.key] = false;
@@ -316,7 +414,7 @@ canvas.addEventListener('mousemove', e => {
 canvas.addEventListener('click', handleAction);
 
 newGame();
-loop();
+requestAnimationFrame(loop);
 </script>
 </body>
 </html>
