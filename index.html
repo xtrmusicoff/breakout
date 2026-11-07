@@ -56,11 +56,16 @@
     font-family: inherit;
   }
   #endless-status { font-size: 15px; font-weight: bold; color: #eee; margin: 6px 0 0; }
+  /* Widescreen: the field is twice as wide (2:1 proportions kept as 8:3), controls hidden */
+  body.widescreen { --game-w: max(320px, min(1600px, calc(100vw - 40px), calc((100vh - 90px) / 0.375))); }
+  body.widescreen #controls,
+  body.widescreen #endless-status { display: none; }
 </style>
 </head>
 <body>
   <div id="hud">
     <span>Score: <span id="score">0</span></span>
+    <span>Wave: <span id="wave">1</span></span>
     <span>Lives: <span id="lives">3</span></span>
   </div>
   <canvas id="game" width="800" height="600"></canvas>
@@ -70,14 +75,18 @@
     <li><kbd>P</kbd>: pause / resume</li>
     <li><kbd>M</kbd>: mute / unmute sound</li>
     <li><kbd>I</kbd>: toggle Endless mode (before starting)</li>
+    <li><kbd>W</kbd>: toggle widescreen field (before the first brick is hit)</li>
+    <li><kbd>L</kbd>: lock / unlock the mouse cursor (Esc also unlocks)</li>
   </ul>
   <p id="endless-status">Endless: OFF</p>
 
 <script>
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-const W = canvas.width;
+const NARROW_W = 800;
+const WIDE_W = 1600;
 const H = canvas.height;
+let W = NARROW_W; // playfield width: 800 normally, 1600 in widescreen mode
 
 // Settings
 const PADDLE_W = 100;
@@ -87,12 +96,12 @@ const PADDLE_SPEED = 8;
 const BALL_R = 8;
 const BALL_SPEED = 5;
 const BRICK_ROWS = 5;
-const BRICK_COLS = 10;
+let BRICK_COLS = 10;  // 20 in widescreen mode
 const BRICK_H = 20;
 const BRICK_GAP = 4;
 const BRICK_MARGIN = 20;
 const BRICK_TOP = 60;
-const BRICK_W = (W - 2 * BRICK_MARGIN - (BRICK_COLS - 1) * BRICK_GAP) / BRICK_COLS;
+let BRICK_W;          // set by setLayout()
 const ROW_COLORS = ['#e74c3c', '#e67e22', '#f1c40f', '#2ecc71', '#3498db'];
 const PARTICLES_PER_BRICK = 14;
 
@@ -107,6 +116,8 @@ const SLOW_FACTOR = 0.6;            // slow ball moves at 60% speed
 const SLOW_MS = 6000;
 const MAX_EXTRA_BALLS = 4;
 const MULTI_SPLIT_ANGLE = 0.45;     // radians the extra balls split off by
+const MULTI_TRIPLE_CHANCE = 0.05;   // chance a multi-ball pickup adds 3 balls instead of 2
+const POWERUP_POINTS = [250, 500, 700]; // each pickup adds one of these at random
 const POWERUP_TYPES = {
   W: { color: '#9b59b6', name: 'wide paddle' },
   M: { color: '#1abc9c', name: 'multi-ball' },
@@ -120,16 +131,28 @@ let muted = false;
 let mouseTargetX = null; // paddle X the mouse last asked for (null = mouse not used yet)
 let mouseInside = false; // true while the cursor is over the game canvas
 let needsGlide = false;  // true when the paddle must glide to the mouse instead of snapping
-const MOUSE_GLIDE_SPEED = 12; // max px per frame for gliding to the mouse
+const MOUSE_GLIDE_SPEED = 26; // max px per frame for gliding to the mouse
 let wideLeft = 0;        // ms of wide paddle left
 let slowLeft = 0;        // ms of slow ball left
 
+// Waves: clearing every brick in Endless mode starts the next wave
+let wave = 1;
+let waveTimer = 0;       // ms since the field was cleared
+let waveRevealed = 0;    // how many rows have reappeared
+let waveFrom = null;     // ball position when the field was cleared
+let frameDt = 0;         // ms since the last frame
+
 // Endless mode
 let endless = false;
+let widescreen = false;
 let ballSpeed = BALL_SPEED;
 let milestonesReached = 0;
 let lastFrameTime = null;
-const ENDLESS_RESTORE_MS = 60000;   // broken bricks come back every minute
+const ENDLESS_RESTORE_MS = 60000;   // wave 1: broken bricks come back after 60 s
+const LATER_RESTORE_MS = 40000;     // wave 2 onward: broken bricks come back after 40 s
+const WAVE_RETURN_MS = 900;         // time for the ball to glide back to the paddle
+const WAVE_ROW_DELAY_MS = 250;      // gap between rows reappearing
+const MAX_WAVES = 4;                // clearing wave 4 wins the game
 const MILESTONE_POINTS = 200;       // speed-up every 200 points
 const MILESTONE_SPEED_STEP = 0.5;
 const MAX_BALL_SPEED = 12;          // keeps the ball from skipping through the paddle
@@ -140,7 +163,8 @@ const sounds = {
   wall: new Audio('sounds/wall.mp3'),
   brick: new Audio('sounds/brick.mp3'),
   powerup: new Audio('sounds/powerup.mp3'),
-  powerup_lose: new Audio('sounds/powerup_lose.mp3')
+  powerup_lose: new Audio('sounds/powerup_lose.mp3'),
+  newwave: new Audio('sounds/newwave.mp3')
 };
 
 function playSound(name) {
@@ -155,6 +179,16 @@ function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
+// Switches between the normal 800 px field and the 1600 px widescreen field
+function setLayout(wide) {
+  widescreen = wide;
+  W = wide ? WIDE_W : NARROW_W;
+  canvas.width = W;
+  BRICK_COLS = wide ? 20 : 10;
+  BRICK_W = (W - 2 * BRICK_MARGIN - (BRICK_COLS - 1) * BRICK_GAP) / BRICK_COLS;
+  document.body.classList.toggle('widescreen', wide);
+}
+
 function makeBricks() {
   const list = [];
   for (let r = 0; r < BRICK_ROWS; r++) {
@@ -166,6 +200,7 @@ function makeBricks() {
         h: BRICK_H,
         color: ROW_COLORS[r],
         alive: true,
+        row: r,
         points: (BRICK_ROWS - r) * 10,
         restoreIn: 0 // ms left until this brick returns (Endless mode)
       });
@@ -185,6 +220,7 @@ function placeBallOnPaddle() {
 
 function updateHud() {
   document.getElementById('score').textContent = score;
+  document.getElementById('wave').textContent = wave;
   document.getElementById('lives').textContent = lives;
 }
 
@@ -201,6 +237,9 @@ function newGame() {
   slowLeft = 0;
   ballSpeed = BALL_SPEED;
   milestonesReached = 0;
+  wave = 1;
+  waveTimer = 0;
+  waveRevealed = 0;
   placeBallOnPaddle();
   updateHud();
 }
@@ -263,11 +302,12 @@ function tickPowerups(dt) {
   }
 }
 
-// Adds two balls that split off the main ball at an angle
+// Adds balls that split off the main ball at angles: usually 2, with a 5% chance of 3
 function spawnExtraBalls() {
-  for (const sign of [-1, 1]) {
+  const A = MULTI_SPLIT_ANGLE;
+  const angles = Math.random() < MULTI_TRIPLE_CHANCE ? [-A, A, 2 * A] : [-A, A];
+  for (const a of angles) {
     if (extraBalls.length >= MAX_EXTRA_BALLS) break;
-    const a = sign * MULTI_SPLIT_ANGLE;
     const cos = Math.cos(a);
     const sin = Math.sin(a);
     extraBalls.push({
@@ -282,6 +322,9 @@ function spawnExtraBalls() {
 // Catching a timed power-up that is already active restarts its timer
 function applyPowerup(type) {
   playSound('powerup');
+  score += POWERUP_POINTS[Math.floor(Math.random() * POWERUP_POINTS.length)];
+  if (endless) checkMilestones();
+  updateHud();
   if (type === 'W') wideLeft = WIDE_MS;
   if (type === 'M') spawnExtraBalls();
   if (type === 'S') slowLeft = SLOW_MS;
@@ -384,7 +427,7 @@ function stepBall(b) {
       br.alive = false;
       score += br.points;
       if (endless) {
-        br.restoreIn = ENDLESS_RESTORE_MS;
+        br.restoreIn = wave >= 2 ? LATER_RESTORE_MS : ENDLESS_RESTORE_MS;
         checkMilestones();
       }
       if (Math.random() < POWERUP_DROP_CHANCE) {
@@ -406,6 +449,48 @@ function stepBall(b) {
   }
 
   return b.y - BALL_R > H ? 'fell' : 'ok';
+}
+
+// Field cleared in Endless mode: the ball glides back to the paddle, then the bricks reappear row by row
+function startWaveTransition() {
+  state = 'clearing';
+  waveTimer = 0;
+  waveRevealed = 0;
+  waveFrom = { x: ball.x, y: ball.y };
+  extraBalls = [];
+  capsules = [];
+  wideLeft = 0;
+  slowLeft = 0;
+  ball.dx = 0;
+  ball.dy = 0;
+}
+
+function updateWaveTransition(dt) {
+  waveTimer += dt;
+  const t = Math.min(waveTimer / WAVE_RETURN_MS, 1);
+  const e = t * t * (3 - 2 * t); // smoothstep: eases in and out
+  const targetX = paddle.x + paddle.w / 2;
+  const targetY = PADDLE_Y - BALL_R;
+  ball.x = waveFrom.x + (targetX - waveFrom.x) * e;
+  ball.y = waveFrom.y + (targetY - waveFrom.y) * e;
+
+  // Bricks reappear one row at a time, starting once the ball is back
+  while (waveRevealed < BRICK_ROWS &&
+         waveTimer >= WAVE_RETURN_MS + waveRevealed * WAVE_ROW_DELAY_MS) {
+    if (waveRevealed === 0) playSound('newwave');
+    for (const b of bricks) {
+      if (b.row === waveRevealed) b.alive = true;
+    }
+    waveRevealed++;
+  }
+
+  if (waveRevealed === BRICK_ROWS &&
+      waveTimer >= WAVE_RETURN_MS + BRICK_ROWS * WAVE_ROW_DELAY_MS) {
+    wave++;
+    placeBallOnPaddle();
+    state = 'ready';
+    updateHud();
+  }
 }
 
 function update() {
@@ -433,6 +518,11 @@ function update() {
   }
 
   updateParticles();
+
+  if (state === 'clearing') {
+    updateWaveTransition(frameDt);
+    return;
+  }
 
   if (state === 'ready') {
     ball.x = paddle.x + paddle.w / 2;
@@ -465,8 +555,9 @@ function update() {
   // Extra balls: remove the ones that fall
   extraBalls = extraBalls.filter(b => stepBall(b) !== 'fell');
 
-  if (!endless && bricks.every(b => !b.alive)) {
-    state = 'won';
+  if (bricks.every(b => !b.alive)) {
+    if (endless && wave < MAX_WAVES) startWaveTransition();
+    else state = 'won';
   }
 }
 
@@ -549,7 +640,7 @@ function draw() {
   }
 
   drawPowerupBars();
-  if (state === 'ready') drawCenterText('BREAKOUT', 'Press Space or click to launch');
+  if (state === 'ready') drawCenterText(wave > 1 ? 'WAVE ' + wave : 'BREAKOUT', 'Press Space or click to launch');
   if (state === 'over') {
     drawCenterText('GAME OVER', endless ? 'Final score: ' + score + '  |  Press Space to play again' : 'Press Space to play again');
   }
@@ -560,6 +651,7 @@ function draw() {
 function loop(now) {
   const dt = lastFrameTime === null ? 0 : Math.min(now - lastFrameTime, 100);
   lastFrameTime = now;
+  frameDt = dt;
   if (state === 'playing') {
     tickPowerups(dt);
     if (endless) updateEndless(dt);
@@ -569,6 +661,26 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
+// Locks the mouse cursor inside the field (Esc always releases it, as browsers require)
+function toggleLock() {
+  if (document.pointerLockElement === canvas) {
+    document.exitPointerLock();
+  } else {
+    Promise.resolve(canvas.requestPointerLock()).catch(() => {}); // ignore if the browser refuses
+  }
+}
+
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement === canvas) {
+    mouseInside = true;
+    mouseTargetX = paddle.x; // start from where the paddle is now
+    needsGlide = false;
+  } else {
+    mouseInside = false;
+    needsGlide = true; // the cursor reappears somewhere else, so glide to it
+  }
+});
+
 // Keyboard
 document.addEventListener('keydown', e => {
   keys[e.key] = true;
@@ -577,6 +689,12 @@ document.addEventListener('keydown', e => {
   if (e.repeat) return;
   if (e.key === 'p' || e.key === 'P') togglePause();
   if (e.key === 'm' || e.key === 'M') muted = !muted;
+  if (e.key === 'l' || e.key === 'L') toggleLock();
+  // Widescreen can only be switched before the first brick is hit, so no progress is lost
+  if ((e.key === 'w' || e.key === 'W') && state === 'ready' && score === 0) {
+    setLayout(!widescreen);
+    newGame();
+  }
   if ((e.key === 'i' || e.key === 'I') && state === 'ready') {
     endless = !endless;
     lives = endless ? 1 : 3;
@@ -598,11 +716,19 @@ canvas.addEventListener('mouseleave', () => {
 });
 canvas.addEventListener('mousemove', e => {
   const rect = canvas.getBoundingClientRect();
+  if (document.pointerLockElement === canvas) {
+    // Locked: the cursor can't move, so move the paddle by how far the mouse moved
+    const base = mouseTargetX !== null ? mouseTargetX : paddle.x;
+    mouseTargetX = clamp(base + e.movementX * (W / rect.width), 0, W - paddle.w);
+    return;
+  }
+  mouseInside = true; // covers returning from a lock, when mouseenter doesn't fire
   const mx = (e.clientX - rect.left) * (W / rect.width);
   mouseTargetX = clamp(mx - paddle.w / 2, 0, W - paddle.w);
 });
 canvas.addEventListener('click', handleAction);
 
+setLayout(false);
 newGame();
 requestAnimationFrame(loop);
 </script>
